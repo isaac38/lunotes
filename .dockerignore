@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+.git
+.vercel
+coverage
+*.md
+.env*
+npm-debug.log*
+Dockerfile
+compose.yml
+compose.dev.yml
+.dockerignore
+.DS_Store
