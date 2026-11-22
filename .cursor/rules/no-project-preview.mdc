@@ -1,0 +1,13 @@
+---
+description: No abrir la vista previa del proyecto en Cursor
+alwaysApply: true
+---
+
+# No abrir la vista previa
+
+No abras la vista previa del proyecto en Cursor. Esto incluye el navegador integrado, Simple Browser, el panel de preview y cualquier pestaña del IDE apuntando a la app (localhost, 127.0.0.1 u otro puerto de desarrollo).
+
+- No navegues a la app ni hagas capturas con las herramientas de navegador de Cursor.
+- No lances el servidor solo para mostrar la interfaz.
+- Comprueba el trabajo con tipos, lint, tests o `curl` si hace falta ver que el servidor responde.
+- Si el usuario pide ver la app, indícale la URL y deja que la abra él.
