@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import ShapeView from "@/components/diagram/ShapeView";
 import {
   BOX_HANDLES,
   COLOR_KEYS,
   COLOR_LABELS,
+  GRID,
   PALETTE,
   PRESETS,
   SELECT_HINT,
@@ -23,6 +24,20 @@ import {
   type ShapeKind,
   type Tool,
 } from "@/components/diagram/model";
+
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 3;
+const ZOOM_STEP = 1.25;
+
+function clampZoom(value: number) {
+  const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, value));
+  return Math.round(clamped * 1000) / 1000;
+}
+
+function positiveMod(value: number, size: number) {
+  if (size === 0) return 0;
+  return ((value % size) + size) % size;
+}
 
 type DrawGesture = {
   type: "draw";
@@ -90,9 +105,13 @@ export default function DiagramEditor() {
   const [draft, setDraft] = useState<Shape | null>(null);
   const [gestureKind, setGestureKind] = useState<Gesture["type"] | null>(null);
   const [grid, setGrid] = useState(true);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
   const [nextColor, setNextColor] = useState<ColorKey | null>(null);
   const [pastCount, setPastCount] = useState(0);
   const [futureCount, setFutureCount] = useState(0);
+  const zoomRef = useRef(1);
+  const panRef = useRef({ x: 0, y: 0 });
 
   const selected = shapes.find((shape) => shape.id === selectedId) ?? null;
   const indicatedColor = nextColor ?? selected?.color ?? null;
@@ -195,10 +214,43 @@ export default function DiagramEditor() {
     commit(shapesRef.current.map((shape) => (shape.id === id ? { ...shape, color } : shape)));
   }
 
+  const commitView = useCallback((nextZoom: number, anchorX: number, anchorY: number) => {
+    const currentZoom = zoomRef.current;
+    const origin = panRef.current;
+    const clamped = clampZoom(nextZoom);
+    const worldX = (anchorX - origin.x) / currentZoom;
+    const worldY = (anchorY - origin.y) / currentZoom;
+    const nextPan = {
+      x: anchorX - worldX * clamped,
+      y: anchorY - worldY * clamped,
+    };
+    zoomRef.current = clamped;
+    panRef.current = nextPan;
+    setZoom(clamped);
+    setPan(nextPan);
+  }, []);
+
+  function zoomBy(factor: number) {
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    commitView(zoomRef.current * factor, bounds ? bounds.width / 2 : 0, bounds ? bounds.height / 2 : 0);
+  }
+
+  function resetView() {
+    zoomRef.current = 1;
+    panRef.current = { x: 0, y: 0 };
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }
+
   function pointFromEvent(event: { clientX: number; clientY: number }) {
     const bounds = canvasRef.current?.getBoundingClientRect();
     if (!bounds) return { x: 0, y: 0 };
-    return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+    const origin = panRef.current;
+    const scale = zoomRef.current;
+    return {
+      x: (event.clientX - bounds.left - origin.x) / scale,
+      y: (event.clientY - bounds.top - origin.y) / scale,
+    };
   }
 
   function beginGesture(event: React.PointerEvent, gesture: Gesture) {
@@ -401,6 +453,21 @@ export default function DiagramEditor() {
         redo();
         return;
       }
+      if (
+        event.key === "=" ||
+        event.key === "+" ||
+        event.key === "Add" ||
+        event.key === "-" ||
+        event.key === "_" ||
+        event.key === "Subtract" ||
+        event.key === "0"
+      ) {
+        event.preventDefault();
+        if (event.key === "-" || event.key === "_" || event.key === "Subtract") zoomBy(1 / ZOOM_STEP);
+        else if (event.key === "0") resetView();
+        else zoomBy(ZOOM_STEP);
+        return;
+      }
       if (event.key === "Delete" || event.key === "Backspace") {
         event.preventDefault();
         removeSelected();
@@ -429,6 +496,33 @@ export default function DiagramEditor() {
     return () => window.removeEventListener("keydown", onKey);
   });
 
+  useEffect(() => {
+    const node = canvasRef.current;
+    if (!node) return;
+    const canvas = node;
+
+    function onWheel(event: WheelEvent) {
+      if (dragRef.current) return;
+      event.preventDefault();
+      const bounds = canvas.getBoundingClientRect();
+      const pixels =
+        event.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? event.deltaY * 40
+          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? event.deltaY * bounds.height
+            : event.deltaY;
+      const factor = Math.exp(-pixels * 0.0025);
+      commitView(
+        zoomRef.current * factor,
+        event.clientX - bounds.left,
+        event.clientY - bounds.top,
+      );
+    }
+
+    node.addEventListener("wheel", onWheel, { passive: false });
+    return () => node.removeEventListener("wheel", onWheel);
+  }, [commitView]);
+
   const editingShape = shapes.find((shape) => shape.id === editingId) ?? null;
   const hint = editingId
     ? "Escribe dentro de la forma. Enter guarda y Escape cancela."
@@ -451,11 +545,28 @@ export default function DiagramEditor() {
         onPointerCancel={endGesture}
         onLostPointerCapture={endGesture}
       >
+        <svg className="pointer-events-none absolute inset-0 h-full w-full">
+          <defs>
+            <pattern
+              id="diagram-dots"
+              width={GRID * zoom}
+              height={GRID * zoom}
+              patternUnits="userSpaceOnUse"
+              x={positiveMod(pan.x, GRID * zoom)}
+              y={positiveMod(pan.y, GRID * zoom)}
+            >
+              <circle cx={zoom} cy={zoom} r={1.15 * zoom} fill="#6f675e" />
+            </pattern>
+          </defs>
+          {grid ? <rect width="100%" height="100%" fill="url(#diagram-dots)" /> : null}
+        </svg>
+
+        <div
+          className="absolute top-0 left-0 h-full w-full origin-top-left"
+          style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+        >
         <svg className="absolute inset-0 h-full w-full overflow-visible">
           <defs>
-            <pattern id="diagram-dots" width="20" height="20" patternUnits="userSpaceOnUse">
-              <circle cx="1" cy="1" r="1.15" fill="#6f675e" />
-            </pattern>
             {COLOR_KEYS.map((color) => (
               <marker
                 key={color}
@@ -471,7 +582,6 @@ export default function DiagramEditor() {
               </marker>
             ))}
           </defs>
-          {grid ? <rect width="100%" height="100%" fill="url(#diagram-dots)" /> : null}
           {shapes.map((shape) => (
             <ShapeView
               key={shape.id}
@@ -554,6 +664,7 @@ export default function DiagramEditor() {
             onCancel={cancelEdit}
           />
         ) : null}
+        </div>
 
         {shapes.length === 0 && !draft ? (
           <div className="pointer-events-none absolute inset-0 grid place-items-center px-6 sm:pl-56">
@@ -581,7 +692,7 @@ export default function DiagramEditor() {
         </div>
         <div className="pointer-events-auto rounded-2xl border border-black/10 bg-white/90 px-3 py-2 text-xs font-medium text-zinc-600 shadow-sm backdrop-blur dark:border-white/10 dark:bg-zinc-900/90 dark:text-zinc-300">
           {selected ? `${PRESETS[selected.kind].label} · ` : null}
-          {shapes.length === 1 ? "1 objeto" : `${shapes.length} objetos`}
+          {Math.round(zoom * 100)}% · {shapes.length === 1 ? "1 objeto" : `${shapes.length} objetos`}
         </div>
       </header>
 
@@ -589,6 +700,7 @@ export default function DiagramEditor() {
         tool={tool}
         indicatedColor={indicatedColor}
         grid={grid}
+        zoom={zoom}
         canUndo={pastCount > 0}
         canRedo={futureCount > 0}
         canDelete={selected !== null}
@@ -596,6 +708,9 @@ export default function DiagramEditor() {
         onTool={chooseTool}
         onColor={applyColor}
         onGrid={() => setGrid((value) => !value)}
+        onZoomIn={() => zoomBy(ZOOM_STEP)}
+        onZoomOut={() => zoomBy(1 / ZOOM_STEP)}
+        onZoomReset={resetView}
         onUndo={undo}
         onRedo={redo}
         onDelete={removeSelected}
@@ -730,6 +845,7 @@ function Toolbar({
   tool,
   indicatedColor,
   grid,
+  zoom,
   canUndo,
   canRedo,
   canDelete,
@@ -737,6 +853,9 @@ function Toolbar({
   onTool,
   onColor,
   onGrid,
+  onZoomIn,
+  onZoomOut,
+  onZoomReset,
   onUndo,
   onRedo,
   onDelete,
@@ -745,6 +864,7 @@ function Toolbar({
   tool: Tool;
   indicatedColor: ColorKey | null;
   grid: boolean;
+  zoom: number;
   canUndo: boolean;
   canRedo: boolean;
   canDelete: boolean;
@@ -752,6 +872,9 @@ function Toolbar({
   onTool: (tool: Tool) => void;
   onColor: (color: ColorKey) => void;
   onGrid: () => void;
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onZoomReset: () => void;
   onUndo: () => void;
   onRedo: () => void;
   onDelete: () => void;
@@ -812,6 +935,15 @@ function Toolbar({
       <Divider />
       <ToolButton active={grid} label="Cuadrícula" onClick={onGrid}>
         <ToolIcon name="grid" />
+      </ToolButton>
+      <ToolButton label="Alejar" shortcut="−" disabled={zoom <= ZOOM_MIN} onClick={onZoomOut}>
+        <ToolIcon name="zoom-out" />
+      </ToolButton>
+      <ToolButton label={`${Math.round(zoom * 100)}%`} shortcut="0" onClick={onZoomReset}>
+        <ToolIcon name="zoom" />
+      </ToolButton>
+      <ToolButton label="Acercar" shortcut="+" disabled={zoom >= ZOOM_MAX} onClick={onZoomIn}>
+        <ToolIcon name="zoom-in" />
       </ToolButton>
       <ToolButton label="Deshacer" disabled={!canUndo} onClick={onUndo}>
         <ToolIcon name="undo" />
@@ -875,7 +1007,11 @@ function ToolButton({
   );
 }
 
-function ToolIcon({ name }: { name: Tool | "undo" | "redo" | "trash" | "grid" | "text" }) {
+function ToolIcon({
+  name,
+}: {
+  name: Tool | "undo" | "redo" | "trash" | "grid" | "text" | "zoom" | "zoom-in" | "zoom-out";
+}) {
   const props = {
     width: 18,
     height: 18,
@@ -978,6 +1114,30 @@ function ToolIcon({ name }: { name: Tool | "undo" | "redo" | "trash" | "grid" | 
           <rect x="13.5" y="4" width="6.5" height="6.5" rx="1" />
           <rect x="4" y="13.5" width="6.5" height="6.5" rx="1" />
           <rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1" />
+        </svg>
+      );
+    case "zoom":
+      return (
+        <svg {...props}>
+          <circle cx="10" cy="10" r="6.5" />
+          <path d="m15 15 5 5" />
+        </svg>
+      );
+    case "zoom-in":
+      return (
+        <svg {...props}>
+          <circle cx="10" cy="10" r="6.5" />
+          <path d="m15 15 5 5" />
+          <path d="M10 7.5v5" />
+          <path d="M7.5 10h5" />
+        </svg>
+      );
+    case "zoom-out":
+      return (
+        <svg {...props}>
+          <circle cx="10" cy="10" r="6.5" />
+          <path d="m15 15 5 5" />
+          <path d="M7.5 10h5" />
         </svg>
       );
   }
