@@ -127,7 +127,7 @@ export const PRESETS: Record<ShapeKind, Preset> = {
 export const SHAPE_KINDS = Object.keys(PRESETS) as ShapeKind[];
 
 export const SELECT_HINT =
-  "Clic de nuevo o Enter para escribir dentro. Arrastra para mover. Supr elimina.";
+  "Clic de nuevo o Enter para escribir dentro. Arrastra para mover. Espacio o el botón central desplaza el lienzo.";
 
 export function toolFromShortcut(key: string): Tool | null {
   const shortcut = key.toLowerCase();
