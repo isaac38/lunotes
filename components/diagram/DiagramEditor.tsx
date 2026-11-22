@@ -28,6 +28,13 @@ import {
 const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 3;
 const ZOOM_STEP = 1.25;
+const GRID_MIN_SCREEN = 14;
+
+function gridScreenStep(zoom: number) {
+  let world = GRID;
+  while (world * zoom < GRID_MIN_SCREEN) world *= 2;
+  return world * zoom;
+}
 
 function clampZoom(value: number) {
   const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, value));
@@ -85,7 +92,15 @@ type ArrowGesture = {
   snapshot: Shape[];
 };
 
-type Gesture = DrawGesture | MoveGesture | ResizeGesture | ArrowGesture;
+type PanGesture = {
+  type: "pan";
+  pointerX: number;
+  pointerY: number;
+  originX: number;
+  originY: number;
+};
+
+type Gesture = DrawGesture | MoveGesture | ResizeGesture | ArrowGesture | PanGesture;
 
 export default function DiagramEditor() {
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -112,6 +127,8 @@ export default function DiagramEditor() {
   const [futureCount, setFutureCount] = useState(0);
   const zoomRef = useRef(1);
   const panRef = useRef({ x: 0, y: 0 });
+  const spaceRef = useRef(false);
+  const [spaceDown, setSpaceDown] = useState(false);
 
   const selected = shapes.find((shape) => shape.id === selectedId) ?? null;
   const indicatedColor = nextColor ?? selected?.color ?? null;
@@ -274,6 +291,8 @@ export default function DiagramEditor() {
     setGestureKind(null);
     setDraft(null);
 
+    if (gesture.type === "pan") return;
+
     if (gesture.type === "draw") {
       const shape: Shape = {
         id: crypto.randomUUID(),
@@ -292,6 +311,20 @@ export default function DiagramEditor() {
     }
 
     if (gesture.moved) remember(gesture.snapshot);
+  }
+
+  function onCanvasPointerDownCapture(event: React.PointerEvent<HTMLDivElement>) {
+    const panning = event.button === 1 || (event.button === 0 && spaceRef.current);
+    if (!panning || dragRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    beginGesture(event, {
+      type: "pan",
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      originX: panRef.current.x,
+      originY: panRef.current.y,
+    });
   }
 
   function onCanvasPointerDown(event: React.PointerEvent<HTMLDivElement>) {
@@ -389,6 +422,16 @@ export default function DiagramEditor() {
     const raw = pointFromEvent(event);
     const gridOn = grid;
 
+    if (gesture.type === "pan") {
+      const next = {
+        x: gesture.originX + event.clientX - gesture.pointerX,
+        y: gesture.originY + event.clientY - gesture.pointerY,
+      };
+      panRef.current = next;
+      setPan(next);
+      return;
+    }
+
     if (gesture.type === "draw") {
       gesture.x = snap(raw.x, gridOn);
       gesture.y = snap(raw.y, gridOn);
@@ -442,6 +485,15 @@ export default function DiagramEditor() {
         return;
       }
 
+      if (event.code === "Space") {
+        event.preventDefault();
+        if (!event.repeat && !spaceRef.current) {
+          spaceRef.current = true;
+          setSpaceDown(true);
+        }
+        return;
+      }
+
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
         event.preventDefault();
         if (event.shiftKey) redo();
@@ -492,8 +544,25 @@ export default function DiagramEditor() {
       if (next) chooseTool(next);
     }
 
+    function onKeyUp(event: KeyboardEvent) {
+      if (event.code !== "Space") return;
+      spaceRef.current = false;
+      setSpaceDown(false);
+    }
+
+    function releaseSpace() {
+      spaceRef.current = false;
+      setSpaceDown(false);
+    }
+
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", releaseSpace);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", releaseSpace);
+    };
   });
 
   useEffect(() => {
@@ -529,40 +598,79 @@ export default function DiagramEditor() {
     : tool === "select"
       ? SELECT_HINT
       : PRESETS[tool].hint;
-  const cursor =
-    gestureKind === "move" ? "cursor-grabbing" : tool === "select" ? "cursor-default" : "cursor-crosshair";
+  const navigating = spaceDown || gestureKind === "pan";
+  const cursor = navigating
+    ? gestureKind === "pan"
+      ? "cursor-grabbing"
+      : "cursor-grab"
+    : gestureKind === "move"
+      ? "cursor-grabbing"
+      : tool === "select"
+        ? "cursor-default"
+        : "cursor-crosshair";
+  const minorStep = gridScreenStep(zoom);
+  const majorStep = minorStep * 5;
 
   return (
-    <div className="relative min-h-0 flex-1 overflow-hidden bg-[#efeae2] font-sans text-zinc-900 select-none dark:bg-[#1c1b19] dark:text-zinc-100">
+    <div className="relative min-h-0 flex-1 overflow-hidden bg-[#efeae2] font-sans text-zinc-900 select-none [--grid-line:rgb(111_103_94/0.38)] [--grid-major:rgb(111_103_94/0.62)] dark:bg-[#1c1b19] dark:text-zinc-100 dark:[--grid-line:rgb(232_224_214/0.16)] dark:[--grid-major:rgb(232_224_214/0.34)]">
       <div
         ref={canvasRef}
         role="application"
         aria-label="Lienzo de diagrama"
         className={`absolute inset-0 touch-none ${cursor}`}
+        onPointerDownCapture={onCanvasPointerDownCapture}
         onPointerDown={onCanvasPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endGesture}
         onPointerCancel={endGesture}
         onLostPointerCapture={endGesture}
+        onAuxClick={(event) => event.preventDefault()}
       >
-        <svg className="pointer-events-none absolute inset-0 h-full w-full">
+        <svg className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden>
           <defs>
             <pattern
-              id="diagram-dots"
-              width={GRID * zoom}
-              height={GRID * zoom}
+              id="diagram-grid-minor"
+              width={minorStep}
+              height={minorStep}
               patternUnits="userSpaceOnUse"
-              x={positiveMod(pan.x, GRID * zoom)}
-              y={positiveMod(pan.y, GRID * zoom)}
+              x={positiveMod(pan.x, minorStep)}
+              y={positiveMod(pan.y, minorStep)}
             >
-              <circle cx={zoom} cy={zoom} r={1.15 * zoom} fill="#6f675e" />
+              <path
+                d={`M ${minorStep} 0 H 0 V ${minorStep}`}
+                fill="none"
+                stroke="var(--grid-line)"
+                strokeWidth="1"
+                shapeRendering="crispEdges"
+              />
+            </pattern>
+            <pattern
+              id="diagram-grid-major"
+              width={majorStep}
+              height={majorStep}
+              patternUnits="userSpaceOnUse"
+              x={positiveMod(pan.x, majorStep)}
+              y={positiveMod(pan.y, majorStep)}
+            >
+              <path
+                d={`M ${majorStep} 0 H 0 V ${majorStep}`}
+                fill="none"
+                stroke="var(--grid-major)"
+                strokeWidth="1"
+                shapeRendering="crispEdges"
+              />
             </pattern>
           </defs>
-          {grid ? <rect width="100%" height="100%" fill="url(#diagram-dots)" /> : null}
+          {grid ? (
+            <>
+              <rect width="100%" height="100%" fill="url(#diagram-grid-minor)" />
+              <rect width="100%" height="100%" fill="url(#diagram-grid-major)" />
+            </>
+          ) : null}
         </svg>
 
         <div
-          className="absolute top-0 left-0 h-full w-full origin-top-left"
+          className={`absolute top-0 left-0 h-full w-full origin-top-left ${navigating ? "pointer-events-none" : ""}`}
           style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
         >
         <svg className="absolute inset-0 h-full w-full overflow-visible">
@@ -671,7 +779,8 @@ export default function DiagramEditor() {
             <div className="max-w-sm rounded-2xl border border-dashed border-black/15 bg-white/75 px-6 py-5 text-center shadow-sm dark:border-white/15 dark:bg-zinc-900/75">
               <p className="text-sm font-semibold">El lienzo está vacío</p>
               <p className="mt-1 text-sm leading-5 text-zinc-500 dark:text-zinc-400">
-                Elige una forma en la barra y haz clic, o arrastra, para crear un objeto.
+                Elige una forma en la barra y haz clic, o arrastra, para crear un objeto. Mantén
+                Espacio, o el botón central, para mover el lienzo.
               </p>
             </div>
           </div>
