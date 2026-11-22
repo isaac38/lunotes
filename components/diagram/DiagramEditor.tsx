@@ -12,8 +12,10 @@ import {
   SELECT_HINT,
   SHAPE_KINDS,
   handlePoint,
+  idsInRect,
   labelBox,
   placedGeometry,
+  rectFromPoints,
   resizeArrow,
   resizeBox,
   snap,
@@ -58,16 +60,27 @@ type DrawGesture = {
 
 type MoveGesture = {
   type: "move";
-  id: string;
+  anchorId: string;
+  anchorX: number;
+  anchorY: number;
   pointerX: number;
   pointerY: number;
-  originX: number;
-  originY: number;
-  lastX: number;
-  lastY: number;
+  lastDx: number;
+  lastDy: number;
   moved: boolean;
   editOnClick: boolean;
+  toggleOffId: string | null;
+  origins: Map<string, { x: number; y: number }>;
   snapshot: Shape[];
+};
+
+type MarqueeGesture = {
+  type: "marquee";
+  originX: number;
+  originY: number;
+  additive: boolean;
+  baseIds: string[];
+  moved: boolean;
 };
 
 type ResizeGesture = {
@@ -100,7 +113,26 @@ type PanGesture = {
   originY: number;
 };
 
-type Gesture = DrawGesture | MoveGesture | ResizeGesture | ArrowGesture | PanGesture;
+type Gesture = DrawGesture | MoveGesture | ResizeGesture | ArrowGesture | PanGesture | MarqueeGesture;
+
+function sameIds(a: string[], b: string[]) {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+function unionIds(base: string[], extra: string[]) {
+  const seen = new Set(base);
+  const next = base.slice();
+  for (const id of extra) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    next.push(id);
+  }
+  return next;
+}
+
+function additivePointer(event: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) {
+  return event.shiftKey || event.metaKey || event.ctrlKey;
+}
 
 export default function DiagramEditor() {
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -113,7 +145,8 @@ export default function DiagramEditor() {
 
   const [shapes, setShapes] = useState<Shape[]>([]);
   const [tool, setTool] = useState<Tool>("select");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
@@ -130,8 +163,14 @@ export default function DiagramEditor() {
   const spaceRef = useRef(false);
   const [spaceDown, setSpaceDown] = useState(false);
 
-  const selected = shapes.find((shape) => shape.id === selectedId) ?? null;
-  const indicatedColor = nextColor ?? selected?.color ?? null;
+  const selectedIdSet = new Set(selectedIds);
+  const selectedShapes = shapes.filter((shape) => selectedIdSet.has(shape.id));
+  const sole = selectedShapes.length === 1 ? selectedShapes[0] : null;
+  const sharedColor =
+    selectedShapes.length > 0 && selectedShapes.every((shape) => shape.color === selectedShapes[0].color)
+      ? selectedShapes[0].color
+      : null;
+  const indicatedColor = nextColor ?? sharedColor;
 
   function remember(snapshot: Shape[]) {
     historyRef.current.push(snapshot);
@@ -157,14 +196,15 @@ export default function DiagramEditor() {
     );
   }
 
-  function bringToFront(id: string) {
+  function bringToFront(ids: readonly string[]) {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
     const prev = shapesRef.current;
-    const index = prev.findIndex((shape) => shape.id === id);
-    if (index < 0 || index === prev.length - 1) return;
-    const next = prev.slice();
-    const [item] = next.splice(index, 1);
-    next.push(item);
-    writeShapes(next);
+    const picked = prev.filter((shape) => idSet.has(shape.id));
+    if (picked.length === 0) return;
+    const tail = prev.slice(prev.length - picked.length);
+    if (tail.every((shape, index) => shape.id === picked[index]?.id)) return;
+    writeShapes([...prev.filter((shape) => !idSet.has(shape.id)), ...picked]);
   }
 
   function commitEdit() {
@@ -185,7 +225,7 @@ export default function DiagramEditor() {
 
   function chooseTool(next: Tool) {
     setTool(next);
-    if (next !== "select") setSelectedId(null);
+    if (next !== "select") setSelectedIds([]);
   }
 
   function undo() {
@@ -196,7 +236,7 @@ export default function DiagramEditor() {
     writeShapes(previous);
     setPastCount(historyRef.current.length);
     setFutureCount(futureRef.current.length);
-    setSelectedId(null);
+    setSelectedIds([]);
     cancelEdit();
   }
 
@@ -208,27 +248,28 @@ export default function DiagramEditor() {
     writeShapes(next);
     setPastCount(historyRef.current.length);
     setFutureCount(futureRef.current.length);
-    setSelectedId(null);
+    setSelectedIds([]);
     cancelEdit();
   }
 
   function removeSelected() {
-    const id = selectedId;
-    if (!id) return;
+    if (selectedIds.length === 0) return;
+    const ids = new Set(selectedIds);
     const prev = shapesRef.current;
-    if (!prev.some((shape) => shape.id === id)) return;
-    commit(prev.filter((shape) => shape.id !== id));
-    setSelectedId(null);
+    const next = prev.filter((shape) => !ids.has(shape.id));
+    if (next.length === prev.length) return;
+    commit(next);
+    setSelectedIds([]);
     cancelEdit();
   }
 
   function applyColor(color: ColorKey) {
     setNextColor(color);
-    const id = selectedId;
-    if (!id || tool !== "select") return;
-    const current = shapesRef.current.find((shape) => shape.id === id);
-    if (!current || current.color === color) return;
-    commit(shapesRef.current.map((shape) => (shape.id === id ? { ...shape, color } : shape)));
+    if (tool !== "select" || selectedIds.length === 0) return;
+    const ids = new Set(selectedIds);
+    const current = shapesRef.current;
+    if (!current.some((shape) => ids.has(shape.id) && shape.color !== color)) return;
+    commit(current.map((shape) => (ids.has(shape.id) ? { ...shape, color } : shape)));
   }
 
   const commitView = useCallback((nextZoom: number, anchorX: number, anchorY: number) => {
@@ -290,8 +331,14 @@ export default function DiagramEditor() {
     dragRef.current = null;
     setGestureKind(null);
     setDraft(null);
+    setMarquee(null);
 
     if (gesture.type === "pan") return;
+
+    if (gesture.type === "marquee") {
+      if (!gesture.moved && !gesture.additive) setSelectedIds([]);
+      return;
+    }
 
     if (gesture.type === "draw") {
       const shape: Shape = {
@@ -299,14 +346,20 @@ export default function DiagramEditor() {
         ...placedGeometry(gesture, grid),
       };
       commit([...shapesRef.current, shape]);
-      setSelectedId(shape.id);
+      setSelectedIds([shape.id]);
       setTool("select");
       if (shape.kind !== "arrow") startEditing(shape);
       return;
     }
 
+    if (gesture.type === "move" && !gesture.moved && gesture.toggleOffId) {
+      const removeId = gesture.toggleOffId;
+      setSelectedIds((current) => current.filter((id) => id !== removeId));
+      return;
+    }
+
     if (gesture.type === "move" && gesture.editOnClick && !gesture.moved) {
-      const shape = shapesRef.current.find((item) => item.id === gesture.id);
+      const shape = shapesRef.current.find((item) => item.id === gesture.anchorId);
       if (shape) startEditing(shape);
     }
 
@@ -332,7 +385,17 @@ export default function DiagramEditor() {
     commitEdit();
 
     if (tool === "select") {
-      setSelectedId(null);
+      const raw = pointFromEvent(event);
+      const additive = additivePointer(event);
+      if (!additive) setSelectedIds([]);
+      beginGesture(event, {
+        type: "marquee",
+        originX: raw.x,
+        originY: raw.y,
+        additive,
+        baseIds: additive ? selectedIds : [],
+        moved: false,
+      });
       return;
     }
 
@@ -355,23 +418,37 @@ export default function DiagramEditor() {
   function onShapePointerDown(event: React.PointerEvent<SVGGElement>, shape: Shape) {
     if (tool !== "select") return;
     event.stopPropagation();
+    if (event.button !== 0) return;
     commitEdit();
+
+    const additive = additivePointer(event);
+    const currentIds = selectedIds;
+    const already = currentIds.includes(shape.id);
     const point = pointFromEvent(event);
     const snapshot = shapesRef.current;
-    const editOnClick = selectedId === shape.id;
-    bringToFront(shape.id);
-    setSelectedId(shape.id);
+    const toggleOffId = additive && already ? shape.id : null;
+    const nextIds = additive && !already ? [...currentIds, shape.id] : already ? currentIds : [shape.id];
+    setSelectedIds(nextIds);
+    if (!toggleOffId) bringToFront(nextIds);
+
+    const origins = new Map<string, { x: number; y: number }>();
+    for (const item of shapesRef.current) {
+      if (nextIds.includes(item.id)) origins.set(item.id, { x: item.x, y: item.y });
+    }
+
     beginGesture(event, {
       type: "move",
-      id: shape.id,
+      anchorId: shape.id,
+      anchorX: shape.x,
+      anchorY: shape.y,
       pointerX: point.x,
       pointerY: point.y,
-      originX: shape.x,
-      originY: shape.y,
-      lastX: shape.x,
-      lastY: shape.y,
+      lastDx: 0,
+      lastDy: 0,
       moved: false,
-      editOnClick,
+      editOnClick: !additive && already && currentIds.length === 1,
+      toggleOffId,
+      origins,
       snapshot,
     });
   }
@@ -439,17 +516,39 @@ export default function DiagramEditor() {
       return;
     }
 
+    if (gesture.type === "marquee") {
+      const rect = rectFromPoints(gesture.originX, gesture.originY, raw.x, raw.y);
+      if (!gesture.moved && rect.w * zoomRef.current < 4 && rect.h * zoomRef.current < 4) return;
+      gesture.moved = true;
+      setMarquee(rect);
+      const hit = idsInRect(shapesRef.current, rect);
+      const next = gesture.additive ? unionIds(gesture.baseIds, hit) : hit;
+      setSelectedIds((current) => (sameIds(current, next) ? current : next));
+      return;
+    }
+
     const dx = raw.x - gesture.pointerX;
     const dy = raw.y - gesture.pointerY;
 
     if (gesture.type === "move") {
-      const x = snap(gesture.originX + dx, gridOn);
-      const y = snap(gesture.originY + dy, gridOn);
-      if (x === gesture.lastX && y === gesture.lastY) return;
-      gesture.lastX = x;
-      gesture.lastY = y;
-      gesture.moved = x !== gesture.originX || y !== gesture.originY;
-      updateShape(gesture.id, { x, y });
+      const x = snap(gesture.anchorX + dx, gridOn);
+      const y = snap(gesture.anchorY + dy, gridOn);
+      const appliedDx = x - gesture.anchorX;
+      const appliedDy = y - gesture.anchorY;
+      if (appliedDx === gesture.lastDx && appliedDy === gesture.lastDy) return;
+      gesture.lastDx = appliedDx;
+      gesture.lastDy = appliedDy;
+      if (appliedDx !== 0 || appliedDy !== 0) {
+        if (!gesture.moved && gesture.toggleOffId) bringToFront([...gesture.origins.keys()]);
+        gesture.moved = true;
+      }
+      writeShapes(
+        shapesRef.current.map((shape) => {
+          const origin = gesture.origins.get(shape.id);
+          if (!origin) return shape;
+          return { ...shape, x: origin.x + appliedDx, y: origin.y + appliedDy };
+        }),
+      );
       return;
     }
 
@@ -468,7 +567,7 @@ export default function DiagramEditor() {
 
   function startEditing(shape: Shape) {
     setTool("select");
-    setSelectedId(shape.id);
+    setSelectedIds([shape.id]);
     editingIdRef.current = shape.id;
     editTextRef.current = shape.text;
     setEditingId(shape.id);
@@ -505,6 +604,12 @@ export default function DiagramEditor() {
         redo();
         return;
       }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a") {
+        event.preventDefault();
+        chooseTool("select");
+        setSelectedIds(shapesRef.current.map((shape) => shape.id));
+        return;
+      }
       if (
         event.key === "=" ||
         event.key === "+" ||
@@ -527,12 +632,12 @@ export default function DiagramEditor() {
       }
       if (event.key === "Escape") {
         cancelEdit();
-        setSelectedId(null);
+        setSelectedIds([]);
         setTool("select");
         return;
       }
-      if ((event.key === "Enter" || event.key === "F2") && selectedId) {
-        const shape = shapesRef.current.find((item) => item.id === selectedId);
+      if ((event.key === "Enter" || event.key === "F2") && selectedIds.length === 1) {
+        const shape = shapesRef.current.find((item) => item.id === selectedIds[0]);
         if (shape) {
           event.preventDefault();
           startEditing(shape);
@@ -605,9 +710,11 @@ export default function DiagramEditor() {
       : "cursor-grab"
     : gestureKind === "move"
       ? "cursor-grabbing"
-      : tool === "select"
-        ? "cursor-default"
-        : "cursor-crosshair";
+      : gestureKind === "marquee"
+        ? "cursor-crosshair"
+        : tool === "select"
+          ? "cursor-default"
+          : "cursor-crosshair";
   const minorStep = gridScreenStep(zoom);
   const majorStep = minorStep * 5;
 
@@ -694,7 +801,7 @@ export default function DiagramEditor() {
             <ShapeView
               key={shape.id}
               shape={shape}
-              selected={shape.id === selectedId}
+              selected={selectedIdSet.has(shape.id)}
               hovered={shape.id === hoveredId && tool === "select"}
               listening={tool === "select" && gestureKind === null}
               onPointerDown={(event) => onShapePointerDown(event, shape)}
@@ -722,39 +829,46 @@ export default function DiagramEditor() {
 
         {shapes.map((shape) =>
           shape.id === editingId ? null : (
-            <ShapeLabel key={shape.id} shape={shape} placeholder={shape.id === selectedId} />
+            <ShapeLabel key={shape.id} shape={shape} placeholder={sole?.id === shape.id} />
           ),
         )}
         {draft && draft.id !== editingId ? <ShapeLabel shape={draft} placeholder={false} /> : null}
 
-        {tool === "select" && selected && selected.kind !== "arrow"
+        {marquee ? (
+          <div
+            className="pointer-events-none absolute z-20 border border-[#1d4ed8] bg-[#1d4ed8]/10"
+            style={{ left: marquee.x, top: marquee.y, width: marquee.w, height: marquee.h }}
+          />
+        ) : null}
+
+        {tool === "select" && sole && sole.kind !== "arrow"
           ? BOX_HANDLES.map((handle) => {
-              const point = handlePoint(selected, handle.id);
+              const point = handlePoint(sole, handle.id);
               return (
                 <div
                   key={handle.id}
                   title="Cambiar tamaño"
                   className="absolute z-20 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-sm border border-zinc-900 bg-white shadow-sm dark:border-white dark:bg-zinc-900"
                   style={{ left: point.x, top: point.y, cursor: handle.cursor }}
-                  onPointerDown={(event) => onResizePointerDown(event, selected, handle.id)}
+                  onPointerDown={(event) => onResizePointerDown(event, sole, handle.id)}
                 />
               );
             })
           : null}
 
-        {tool === "select" && selected && selected.kind === "arrow" ? (
+        {tool === "select" && sole && sole.kind === "arrow" ? (
           <>
             <div
               title="Mover el origen"
               className="absolute z-20 h-3 w-3 -translate-x-1/2 -translate-y-1/2 cursor-move rounded-full border border-zinc-900 bg-white shadow-sm dark:border-white dark:bg-zinc-900"
-              style={{ left: selected.x, top: selected.y }}
-              onPointerDown={(event) => onArrowPointerDown(event, selected, "start")}
+              style={{ left: sole.x, top: sole.y }}
+              onPointerDown={(event) => onArrowPointerDown(event, sole, "start")}
             />
             <div
               title="Mover la punta"
               className="absolute z-20 h-3 w-3 -translate-x-1/2 -translate-y-1/2 cursor-move rounded-full border border-zinc-900 bg-white shadow-sm dark:border-white dark:bg-zinc-900"
-              style={{ left: selected.x + selected.w, top: selected.y + selected.h }}
-              onPointerDown={(event) => onArrowPointerDown(event, selected, "end")}
+              style={{ left: sole.x + sole.w, top: sole.y + sole.h }}
+              onPointerDown={(event) => onArrowPointerDown(event, sole, "end")}
             />
           </>
         ) : null}
@@ -800,7 +914,11 @@ export default function DiagramEditor() {
           </div>
         </div>
         <div className="pointer-events-auto rounded-2xl border border-black/10 bg-white/90 px-3 py-2 text-xs font-medium text-zinc-600 shadow-sm backdrop-blur dark:border-white/10 dark:bg-zinc-900/90 dark:text-zinc-300">
-          {selected ? `${PRESETS[selected.kind].label} · ` : null}
+          {selectedShapes.length > 1
+            ? `${selectedShapes.length} seleccionados · `
+            : sole
+              ? `${PRESETS[sole.kind].label} · `
+              : null}
           {Math.round(zoom * 100)}% · {shapes.length === 1 ? "1 objeto" : `${shapes.length} objetos`}
         </div>
       </header>
@@ -812,8 +930,8 @@ export default function DiagramEditor() {
         zoom={zoom}
         canUndo={pastCount > 0}
         canRedo={futureCount > 0}
-        canDelete={selected !== null}
-        canWrite={selected !== null}
+        canDelete={selectedShapes.length > 0}
+        canWrite={sole !== null}
         onTool={chooseTool}
         onColor={applyColor}
         onGrid={() => setGrid((value) => !value)}
@@ -824,7 +942,7 @@ export default function DiagramEditor() {
         onRedo={redo}
         onDelete={removeSelected}
         onWrite={() => {
-          if (selected) startEditing(selected);
+          if (sole) startEditing(sole);
         }}
       />
     </div>
@@ -998,6 +1116,7 @@ function Toolbar({
         active={tool === "select"}
         label="Seleccionar"
         shortcut="V"
+        title="Seleccionar (V). Mayús+clic o un recuadro elige varios"
         onClick={() => onTool("select")}
       >
         <ToolIcon name="select" />
@@ -1079,6 +1198,7 @@ function ToolButton({
   disabled = false,
   label,
   shortcut,
+  title,
   onClick,
   children,
 }: {
@@ -1086,15 +1206,17 @@ function ToolButton({
   disabled?: boolean;
   label: string;
   shortcut?: string;
+  title?: string;
   onClick: () => void;
   children: React.ReactNode;
 }) {
+  const hint = title ?? (shortcut ? `${label} (${shortcut})` : label);
   return (
     <button
       type="button"
       aria-label={shortcut ? `${label} (${shortcut})` : label}
       aria-pressed={active}
-      title={shortcut ? `${label} (${shortcut})` : label}
+      title={hint}
       disabled={disabled}
       onClick={onClick}
       className={`flex h-9 w-9 shrink-0 items-center justify-center gap-2 rounded-xl text-xs font-medium transition-colors disabled:pointer-events-none disabled:opacity-35 sm:h-8 sm:w-full sm:justify-start sm:px-2 ${

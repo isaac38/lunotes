@@ -127,7 +127,7 @@ export const PRESETS: Record<ShapeKind, Preset> = {
 export const SHAPE_KINDS = Object.keys(PRESETS) as ShapeKind[];
 
 export const SELECT_HINT =
-  "Clic de nuevo o Enter para escribir dentro. Arrastra para mover. Espacio o el botón central desplaza el lienzo.";
+  "Mayús+clic o un recuadro eligen varios; arrástralos para moverlos juntos. Clic de nuevo o Enter escribe. Espacio desplaza el lienzo.";
 
 export function toolFromShortcut(key: string): Tool | null {
   const shortcut = key.toLowerCase();
@@ -310,6 +310,41 @@ export const BOX_HANDLES: { id: BoxHandle; cursor: string }[] = [
   { id: "sw", cursor: "nesw-resize" },
   { id: "w", cursor: "ew-resize" },
 ];
+
+export type Rect = { x: number; y: number; w: number; h: number };
+
+export function shapeBounds(shape: Pick<Shape, "kind" | "x" | "y" | "w" | "h">): Rect {
+  if (shape.kind !== "arrow") {
+    return { x: shape.x, y: shape.y, w: shape.w, h: shape.h };
+  }
+
+  const x2 = shape.x + shape.w;
+  const y2 = shape.y + shape.h;
+  const pad = 8;
+  return {
+    x: Math.min(shape.x, x2) - pad,
+    y: Math.min(shape.y, y2) - pad,
+    w: Math.abs(shape.w) + pad * 2,
+    h: Math.abs(shape.h) + pad * 2,
+  };
+}
+
+export function rectsIntersect(a: Rect, b: Rect) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+export function rectFromPoints(x1: number, y1: number, x2: number, y2: number): Rect {
+  return {
+    x: Math.min(x1, x2),
+    y: Math.min(y1, y2),
+    w: Math.abs(x2 - x1),
+    h: Math.abs(y2 - y1),
+  };
+}
+
+export function idsInRect(shapes: readonly Shape[], rect: Rect) {
+  return shapes.filter((shape) => rectsIntersect(shapeBounds(shape), rect)).map((shape) => shape.id);
+}
 
 export function handlePoint(shape: Pick<Shape, "x" | "y" | "w" | "h">, handle: BoxHandle) {
   const midX = shape.x + shape.w / 2;
