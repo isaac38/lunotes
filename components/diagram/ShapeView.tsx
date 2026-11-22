@@ -38,6 +38,19 @@ export default function ShapeView({
       onPointerEnter={onPointerEnter}
       onPointerLeave={onPointerLeave}
     >
+      {selected && shape.kind === "arrow" ? (
+        <line
+          x1={shape.x}
+          y1={shape.y}
+          x2={shape.x + shape.w}
+          y2={shape.y + shape.h}
+          stroke={tone.stroke}
+          strokeOpacity={0.35}
+          strokeWidth={8}
+          strokeLinecap="round"
+          pointerEvents="none"
+        />
+      ) : null}
       <ShapeGraphic shape={shape} fill={tone.fill} stroke={tone.stroke} strokeWidth={strokeWidth} />
       {selected && shape.kind !== "arrow" ? (
         <rect
